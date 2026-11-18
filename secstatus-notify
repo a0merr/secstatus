@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""secstatus-notify - desktop popups when the SEC//STATUS threat level changes."""
+import os, subprocess, time
+
+STATUS = "/run/secstatus/status"
+POLL = 3    # seconds
+STALE = 20  # daemon writes every 5s; older than this means it's down or hung
+MISSES = 3  # consecutive bad reads before saying OFFLINE (rides out restarts)
+
+STYLE = {
+    "GREEN":   ("low",      "security-high",  "All clear"),
+    "YELLOW":  ("normal",   "dialog-warning", "Threat level: YELLOW"),
+    "RED":     ("critical", "dialog-error",   "Threat level: RED"),
+    "OFFLINE": ("critical", "dialog-error",   "SEC//STATUS daemon offline"),
+}
+
+
+def read_status():
+    """Status dict, or None if the file is missing or stale (daemon down or hung)."""
+    try:
+        if time.time() - os.path.getmtime(STATUS) > STALE:
+            return None
+        with open(STATUS) as f:
+            return dict(l.rstrip("\n").split("=", 1) for l in f if "=" in l)
+    except OSError:
+        return None
+
+
+def notify(level, body):
+    urgency, icon, title = STYLE[level]
+    subprocess.run(["notify-send", "-a", "SEC//STATUS", "-u", urgency,
+                    "-i", icon, title, body], check=False)
+
+
+def describe(s):
+    parts = []
+    if s.get("NEW"):
+        ports = [n.rsplit(":", 1)[-1] for n in s["NEW"].split(";") if n]
+        parts.append("New listener on port " + ", ".join(ports))
+    if s.get("OUTBOUND"):
+        for entry in s["OUTBOUND"].split(";"):
+            if entry:
+                name, _, rest = entry.partition("@")
+                peer, _, ctx = rest.partition(" | ")
+                parts.append(f"New outbound: {name} → {peer}")
+                if ctx:
+                    parts.append(f"  {ctx[:90]}")
+        parts.append("Trust it with: sudo secstatus approve")
+    if s.get("RECENT", "0") != "0":
+        parts.append(f"{s['RECENT']} auth fail(s) in 10 min, last: {s.get('LAST_FAIL', '?')}")
+    return "\n".join(parts) or "Nothing unusual right now."
+
+
+def grew(old, new):
+    """True if any port or outbound program appeared that wasn't there before."""
+    return any(set(filter(None, n.split(";"))) - set(filter(None, o.split(";")))
+               for o, n in zip(old, new))
+
+
+def main():
+    last_level, last_new = None, ("", "")
+    misses = 0
+    while True:
+        s = read_status()
+        if s is None:
+            misses += 1
+            if misses < MISSES:
+                time.sleep(POLL)
+                continue
+        else:
+            misses = 0
+        level = s.get("LEVEL", "OFFLINE") if s else "OFFLINE"
+        new = (s.get("NEW", ""), s.get("OUTBOUND", "")) if s else ("", "")
+
+        if last_level is None:
+            # Starting up: only speak if something is already wrong
+            if level != "GREEN":
+                notify(level, describe(s) if s else "No status file found.")
+        elif level != last_level:
+            notify(level, describe(s) if s else "No status file found.")
+        elif grew(last_new, new) and level != "GREEN":
+            notify(level, describe(s))  # something else appeared while already yellow
+
+        last_level, last_new = level, new
+        time.sleep(POLL)
+
+
+if __name__ == "__main__":
+    main()
